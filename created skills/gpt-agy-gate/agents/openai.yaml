@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT AGY Gate"
+  short_description: "Coordinate Antigravity implementation with Codex audit"
+  default_prompt: "Use the GPT AGY Gate workflow for this scoped implementation task."
