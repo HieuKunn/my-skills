@@ -1,176 +1,158 @@
-# Codex ↔ Antigravity Live PM Protocol
+# Codex ↔ Antigravity Bridge Protocol
 
-Ba file trong `.antigravity/agy-bridge/`:
+## Phạm vi
 
-- `PROTOCOL.md`: quy tắc duy nhất của bridge.
-- `bridge.py`: chuyển đúng một lượt task cho Antigravity.
-- `chat.md`: mailbox và nhật ký hội thoại.
+Bridge dùng đúng ba file:
 
-## Vai trò
+- `bridge.py`: điều phối một attempt.
+- `chat.md`: mailbox, packet và response.
+- `PROTOCOL.md`: luật vận hành.
 
-- User giao mục tiêu cho Codex trong cửa sổ chat.
-- Codex live là PM và auditor duy nhất.
-- Antigravity là implementer, chỉ sửa file trong phạm vi task.
-- Bridge chỉ chuyển task và ghi response; không gọi Codex CLI, không tự audit, không tự approve, không chạy nền.
+Bridge không dùng `tasks/`, `schema/`, `templates/`, `defaults.json`, `spec.md`, `state.json` hoặc `history.jsonl`.
 
-## Quy trình bắt buộc
+## Phân vai
 
-1. Codex đọc AGENTS.md, skill và file liên quan.
-2. Codex ghi task packet `status=queued` vào `chat.md`, gồm `task_id`, scope, acceptance criteria, quality gates, `MAX_ROUNDS` và `do_not_change`.
-3. Codex chạy `python3 .antigravity/agy-bridge/bridge.py` đúng một lần.
-4. Bridge gọi `agy` một lượt, ghi `Antigravity → Codex` và chuyển task sang `waiting-review`.
-5. Codex live chờ response, đọc diff/file thật, chạy kiểm tra cần thiết.
-6. Nếu chưa đạt, Codex ghi một revision assignment mới vào `chat.md`, tăng round và chạy bridge một lần nữa.
-7. Nếu đạt, Codex chuyển task sang `approved` và báo cáo User.
-8. Nếu User bảo dừng, Codex dừng process, chuyển task sang `stopped` và không tự chạy lại.
+- User giao mục tiêu, phạm vi, chất lượng và giới hạn riêng của task.
+- Codex là PM, viết packet, điều phối, audit diff/file/test và quyết định verdict.
+- Antigravity là implementer, tự sửa trong scope, tự kiểm tra và báo cáo.
+- Bridge chỉ khóa mailbox, kiểm tra packet, gọi một attempt, ghi response và chuyển trạng thái.
 
-### Live loop tự động sau audit
+Antigravity không được tự approve. Bridge không được tự audit hoặc approve.
 
-- `bridge.py --once` chỉ thực hiện một round; không được hiểu là toàn bộ task đã kết thúc.
-- Trong cùng một live turn, sau khi Antigravity trả response, Codex phải audit diff/file thật. Nếu acceptance criteria chưa đạt và vẫn còn round, Codex tự tạo revision assignment, cập nhật round và tự gọi lại `python3 .antigravity/agy-bridge/bridge.py --once` mà không cần User xác nhận.
-- Quy trình tự lặp là: dispatch → chờ response → audit → revision nếu fail → dispatch lại. Chỉ kết thúc khi task `approved`, User yêu cầu dừng, có blocker thật cần User quyết định, hoặc đã chạm `MAX_ROUNDS`.
-- `MAX_ROUNDS` là giới hạn tối đa cho toàn bộ live loop, không phải số vòng tối thiểu. Không được dừng sớm chỉ vì một round đã trả response nếu task vẫn chưa đạt và còn quota.
-- Nếu chạm `MAX_ROUNDS` mà chưa đạt, chuyển task sang `stopped`, ghi `MAX_ROUNDS_EXHAUSTED`, rồi mới báo User.
+## Mailbox và FIFO
 
-### Kế thừa và thay đổi giới hạn vòng
+`chat.md` chỉ giữ tối đa 3 task stream gần nhất. Một task stream gồm task gốc và mọi revision của nó. Revision không chiếm slot riêng.
 
-- Nếu User không nêu `MAX_ROUNDS` mới, Codex phải kế thừa giới hạn đang có hiệu lực cho task/workflow hiện tại; không tự đặt lại hoặc dùng một giá trị khác.
-- Nếu User nêu `MAX_ROUNDS` mới, Codex phải cập nhật con số đó trong task packet và mọi assignment/revision record liên quan trước khi dispatch bridge.
-- Bridge chỉ được chạy sau khi packet đã chứa giới hạn cuối cùng. Không để prompt dispatch, packet và log cùng task ghi các giới hạn khác nhau.
-- Khi audit, Codex phải dùng đúng giới hạn đã ghi trong packet active; không tính các giá trị cũ trong log lịch sử là vòng mới.
-- Một task chỉ có duy nhất một giá trị `MAX_ROUNDS` có hiệu lực. Giá trị đó phải nhất quán trong task packet, mọi revision assignment, prompt dispatch, bridge/runtime record và mọi file code hoặc file cấu hình tham gia điều phối task. Không được để packet ghi một limit nhưng code, prompt hoặc revision dùng limit khác.
-- Trước mỗi dispatch và trước mỗi revision, Codex phải kiểm tra sự nhất quán của limit giữa các thành phần liên quan. Nếu phát hiện lệch, phải sửa về giá trị đã được User đặt rồi mới chạy tiếp; không được âm thầm chọn giá trị thấp hơn hoặc cao hơn.
-- Các task khác nhau có thể có `MAX_ROUNDS` khác nhau; không được lấy limit của task trước áp dụng sang task mới. Lịch sử cũ chỉ để tham chiếu, không có hiệu lực runtime.
+Khi thêm task gốc thứ tư, bridge xóa toàn bộ stream cũ nhất theo thời điểm `created`. Đây là FIFO và là hành vi xóa lịch sử khỏi mailbox theo yêu cầu. Bridge xóa cả packet và các message của stream đó.
 
-### Live response handoff và quota
+Khi có hơn 3 stream, bridge phải áp dụng FIFO trước rồi mới validate mailbox còn lại. Bridge phải từ chối task ID sai, revision sai parent, ROUND trùng hoặc revision không tăng dần trong các packet mới.
 
-- Bridge là process đồng bộ: Codex mở một lượt bridge và chờ process đó kết thúc. Không dùng polling `chat.md` trong khi Antigravity đang chạy.
-- **Quy tắc chờ live tuyệt đối:** Trong một bridge cycle đang chạy, Codex chỉ giữ live session để chờ process bàn giao. Cấm đọc lại `chat.md`, kiểm tra diff/file, gọi status, spawn thêm bridge hoặc lặp các lệnh kiểm tra giữa chừng. Chỉ khi bridge process đã kết thúc và ghi response thì Codex mới được bắt đầu audit. Việc chờ bằng chính session/process là hợp lệ; polling mailbox không hợp lệ.
-- Chỉ coi lượt làm việc đã sẵn sàng audit khi bridge đã ghi block `Antigravity → Codex` vào `chat.md` và trả control về Codex. Response đó là tín hiệu bàn giao; không cần kiểm tra mailbox định kỳ.
-- Sau tín hiệu bàn giao, Codex chỉ đọc response, diff/file vừa sửa và các test gộp hoặc risk sample cần thiết. Không đọc lại toàn bộ workspace nếu phần đó không đổi.
-- Nếu bridge process chết, timeout hoặc không ghi response, Codex được phép kiểm tra một lần để chẩn đoán launcher failure; không tự dispatch lặp vô hạn.
-- Quy tắc này giảm lượt đọc và quota, nhưng không biến mailbox thành daemon và không đảm bảo đánh thức một Codex session đã kết thúc. Muốn cycle tiếp tục, phiên Codex live phải còn mở hoặc phải được mở lại.
-- Sau khi đã dispatch task, Codex không được gửi `final`, không được kết thúc lượt và không được báo “đang chờ” như một kết luận tạm thời. Codex phải giữ live turn, chờ bridge trả response, audit và tự dispatch revision tiếp theo nếu cần.
-- Chỉ được kết thúc live turn khi task đã `approved`, đã `stopped` vì chạm `MAX_ROUNDS`, User yêu cầu dừng, hoặc có blocker thật cần User quyết định. Khi kết thúc phải báo trạng thái terminal chính xác.
+## Packet bắt buộc
+
+```text
+<!-- TASK id=TASK-001 status=queued created=2026-11-09T16:00:00+08:00 -->
+TASK_VERSION: 1
+PARENT_TASK: none
+ROUND: 1
+MAX_ROUNDS: 2
+TIMEOUT_SECONDS: 7200
+MAX_SUBAGENT_CALLS: 0
+MAX_PARALLEL_AGENTS: 1
+ACCEPTANCE_MODE: delegated
+
+Objective:
+...
+
+Context:
+...
+
+Scope:
+...
+
+Do:
+...
+
+Do not:
+...
+
+Definition of Done:
+...
+
+Verification:
+...
+
+Agent policy:
+...
+
+Report format:
+Changed:
+Verified:
+Evidence:
+Remaining:
+Decision:
+<!-- END TASK -->
+```
+
+`MAX_ROUNDS` là tổng số attempt của Antigravity chính. `MAX_SUBAGENT_CALLS` và `MAX_PARALLEL_AGENTS` là giới hạn riêng cho agent con. Task mới không kế thừa limit task cũ.
+
+## Context và quota
+
+Bridge không nhúng toàn bộ `AGENTS.md` hoặc `PROTOCOL.md` vào prompt. Prompt phải yêu cầu Antigravity đọc trực tiếp hai file đó từ workspace, kèm đường dẫn rõ ràng.
+
+Bridge chỉ truyền:
+
+- packet task đầy đủ;
+- limit của task;
+- agent policy;
+- revision hiện hành;
+- các luật áp dụng trực tiếp cho task.
+
+Hash file luật có thể được ghi trong response để truy nguyên phiên bản. Hash không chứng minh mô hình hiểu hoàn toàn nội dung; Codex vẫn phải kiểm tra kết quả thật.
+
+## Agent policy
+
+Mỗi attempt mặc định có một Antigravity chính. Antigravity chỉ được gọi subagent khi packet cho phép. Subagent không được mở rộng scope, sửa file dùng chung trái phép hoặc approve.
+
+Codex chỉ chạy nhiều Antigravity song song khi mỗi agent có scope không chồng lấn. Không chạy song song khi cùng sửa `bridge.py`, `PROTOCOL.md`, `AGENTS.md`, `chat.md` hoặc file dùng chung.
 
 ## Lifecycle
 
-`queued → running → waiting-review → queued → running → waiting-review → approved`
-
-Nhánh lỗi: `running → rejected`.
-
-Không dùng `AUTOPILOT` để biến bridge thành PM nền. `MAX_ROUNDS` là giới hạn mà Codex live phải tự đếm; khi chạm giới hạn mà chưa đạt, chuyển `stopped` và ghi `MAX_ROUNDS_EXHAUSTED`.
-
-## Hội thoại bắt buộc trong chat.md
-
-- `Codex → Antigravity`: task assignment hoặc revision assignment.
-- `Antigravity → Codex`: implementation response.
-- Codex không được chuyển `approved` dựa trên báo cáo của Antigravity mà chưa kiểm tra diff/file thật.
-- Antigravity không được tự approve, tự commit, tự push, tự xóa, đổi tên hoặc mở rộng scope.
-
-## Quy tắc dừng
-
-- Không có process bridge hoặc Antigravity nào được giữ chạy sau khi task kết thúc.
-- Không có Codex CLI PM nền.
-- Khi lượt chat của Codex kết thúc, cycle live kết thúc; mailbox không được coi là cơ chế đánh thức lại Codex.
-- Task terminal (`approved`, `rejected`, `stopped`) không được tự chạy lại.
-
-## Default tiết kiệm quota cho mọi task
-
-Trừ khi User yêu cầu khác, Codex và Antigravity phải dùng chiến lược dưới đây cho mọi task, không chỉ workspace này.
-
-### 1. Một spec hoàn chỉnh, không chia task vụn
-
-- Codex phải giao một task packet tổng trước khi chạy agent: objective, scope, việc cấm, Definition of Done, test bắt buộc, format report và `MAX_ROUNDS`.
-- Agent phải tự phân rã công việc nội bộ; không trả plan-only hoặc audit-only khi task có thể triển khai được.
-- Default `MAX_ROUNDS: 2`: một lượt implementation toàn scope và tối đa một lượt revision tổng. Khi User đặt limit khác, live loop phải dùng đúng limit đó và tự chạy tiếp qua các revision cần thiết cho đến khi đạt hoặc hết limit. Không tạo revision theo module/chức năng nhỏ nếu chưa có lỗi đo được.
-- Mỗi task chỉ có một packet `queued` active. Revision phải là packet mới độc lập có `<!-- END TASK -->`; không nhét revision vào lịch sử chat của packet cũ.
-
-### 2. Chọn agent và model theo độ khó
-
-- Việc cơ học, inventory, format, link scan, lint và migration rõ: dùng model nhẹ khi có.
-- Debug, refactor và feature thông thường: dùng model workhorse.
-- Kiến trúc, security, dữ liệu chuyên môn có rủi ro cao, nghiên cứu hoặc nội dung giáo trình: dùng model mạnh; không dùng model nhẹ để bịa kiến thức.
-- Nếu task lớn có các vùng file độc lập, Codex có thể giao song song; mỗi agent phải sở hữu một vùng file không chồng lấp. Không cho nhiều agent cùng sửa shared CSS, config, lockfile, mailbox hoặc một file.
-
-### 3. Agent tự kiểm tra trước khi báo
-
-- Agent phải sửa file thật, tự chạy test phù hợp rồi mới trả response.
-- Agent không được trả lời bằng lời chào, nhắc lại yêu cầu, kế hoạch dài, chain-of-thought hoặc liệt kê mọi file đã đọc nếu không cần để debug.
-- Báo cáo mặc định chỉ gồm:
-  - `Changed`: file và thay đổi thực.
-  - `Verified`: test và kết quả có số liệu.
-  - `Remaining`: lỗi/blocker còn lại, hoặc `none`.
-  - `Decision`: chỉ ghi khi Codex/User thật sự phải chọn.
-
-### 4. Audit tối thiểu nhưng đủ tin
-
-Codex không được đọc mọi file chỉ để yên tâm. Audit theo ba lớp:
-
-- Machine checks: build/test/lint/parser/type check/link-anchor-asset scan/secret-or-placeholder scan tùy task.
-- Diff and scope check: xác nhận file đổi đúng scope, không có placeholder, hard-code hoặc copy-paste rõ ràng.
-- Risk sample: chỉ đọc sâu file đầu/cuối, luồng quan trọng, logic phức tạp hoặc phần User báo lỗi.
-
-Chỉ tạo revision khi test fail, Definition of Done chưa đạt, report mâu thuẫn file thật, agent không sửa, vượt scope, hoặc User thấy lỗi. Pass thì approve ngay, không cố dùng hết rounds.
-
-### 5. Quản lý mailbox và bridge
-
-- Bridge luôn dispatch packet `queued` mới nhất có `<!-- END TASK -->`; không replay packet lịch sử.
-- Codex phải chuyển packet cũ sang terminal trước khi tạo task thay thế.
-- Không dùng polling/diff liên tục khi agent đang chạy. Chỉ kiểm tra một lần khi agent phản hồi, trừ khi User yêu cầu status.
-- Không tạo Codex CLI PM, background watcher hoặc agent nền; live Codex là PM duy nhất.
-
-### 6. Template ngắn User giao Codex
-
 ```text
-Làm [mục tiêu].
-
-Phạm vi: [folder/file/system].
-Cấm: [xóa/rename/commit/push hoặc giới hạn khác].
-Chất lượng: [tiêu chí].
-Tự giao Antigravity làm toàn bộ một lần, dùng subagent nội bộ nếu cần.
-Tối đa 2 vòng: implementation + revision.
-Mày chỉ audit bằng test gộp, diff và sample rủi ro.
-Không chat kế hoạch, không audit-only, không chia task lẻ.
-Xong mới báo tao.
+queued → running → waiting-review → approved
+                         ├────────→ verified
+                         ├────────→ rejected → queued
+                         ├────────→ blocked
+                         └────────→ stopped
 ```
 
-### 7. Format Spec chuẩn Codex giao Antigravity
+- Chỉ packet `queued` được dispatch.
+- `waiting-review`, `rejected`, `verified`, `approved` và `stopped` không tự replay.
+- `MAX_ROUNDS` hết trước khi đạt thì chuyển `stopped` với lý do `MAX_ROUNDS_EXHAUSTED`.
+- Timeout hoặc lỗi môi trường chuyển `blocked`.
+- `delegated` cho phép Codex approve sau audit.
+- `user_required` chỉ cho Codex ghi `verified`; User phải chấp nhận để thành `approved`.
+
+`bridge.py --once` chỉ gọi đúng một attempt. Nó không chạy toàn bộ vòng audit và revision.
+
+## Audit của Codex
+
+Codex kiểm tra ba lớp:
+
+- Machine checks: command, exit code, test output và artifact.
+- Diff/scope: file đổi thật, đúng phạm vi, không placeholder, không sửa trái luật.
+- Risk sample: đọc sâu các file và logic có rủi ro.
+
+CLI return code 0 chỉ chứng minh transport thành công. Nó không chứng minh task đạt. Response JSON lỗi, response rỗng hoặc thiếu report đều bị đánh dấu `rejected`.
+
+## Report bắt buộc
+
+Antigravity chỉ trả:
 
 ```text
-<!-- TASK id=<unique-id> status=queued from=codex -->
-AUTOPILOT: false
-MAX_ROUNDS: 2
+Changed:
+- File và thay đổi cụ thể.
 
-Objective:
-[Outcome cuối]
+Verified:
+- Lệnh đã chạy, kết quả và exit code.
 
-Scope:
-[File/thư mục/hệ thống]
+Evidence:
+- Artifact hoặc output chứng minh.
 
-Do:
-[Các việc phải làm]
+Remaining:
+- none hoặc blocker cụ thể.
 
-Do not:
-[Không rename/delete/commit/push...]
-
-Definition of Done:
-[Điều kiện pass đo được]
-
-Verification:
-[Test cụ thể]
-
-Execution:
-- Tự chia việc nội bộ nếu cần.
-- Không gửi báo cáo giữa chừng.
-- Không trả plan-only/audit-only.
-- Chỉ trả khi hoàn thành tối đa scope hoặc có blocker thực tế.
-
-Report only:
-- Changed: [file: thay đổi]
-- Verified: [test: result]
-- Remaining: [none / blocker]
-- Decision: [none / cần chọn X]
-
-<!-- END TASK -->
+Decision:
+- none hoặc quyết định cần Codex/User.
 ```
+
+Codex phải reject khi report mâu thuẫn diff, không có verification, evidence không tồn tại, hoặc Anti tự tuyên bố approve.
+
+## Lock và stop condition
+
+Bridge dùng một lock hệ điều hành để ngăn hai process cùng sửa `chat.md`. Khi lock đang bị giữ, process mới dừng ngay.
+
+Bridge dừng task khi hết limit, timeout, lỗi transport, packet sai hoặc không có task `queued`. Không có bridge nền và không có Codex PM nền.
+
+## FIFO và dữ liệu cũ
+
+Task bị FIFO loại khỏi `chat.md` không được bridge gọi lại. Nếu cần giữ lâu dài, Codex phải đưa nội dung sang một file tài liệu riêng trước khi task bị loại. Bridge không tự tạo archive.

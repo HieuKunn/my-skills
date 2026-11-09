@@ -1,11 +1,26 @@
-# Bridge Contract
+# Bridge Contract and Lifecycle
 
-The bridge is a domain-neutral one-shot runner, not an autonomous auditor.
+The bridge is a strictly controlled one-shot attempt runner, not an autonomous auditor or background daemon.
+
+## Lifecycle States
 
 ```text
-queued -> bridge.py (one shot) -> running -> agy response -> waiting-review
+queued → running → waiting-review → approved
+                         ├────────→ verified (user_required)
+                         ├────────→ rejected → queued (new revision)
+                         ├────────→ blocked (timeout / error)
+                         └────────→ stopped (cap exhausted / manual stop)
 ```
 
-Codex live performs the audit. It writes either a revision assignment or the terminal `approved` decision, then runs the bridge once for the next round when allowed. The bridge must not call `codex exec`, auto-approve, re-queue indefinitely, run as a background daemon, or wake a closed chat session. The implementation details and quality gates come entirely from the current user's task packet.
+## Protocol Guardrails
 
-The active Codex turn must remain open while the task is being coordinated. A final response is sent only after approval, stop, or a real blocker.
+- Bridge executes one attempt per run (`bridge.py` or `bridge.py --once`).
+- Bridge applies OS-level file lock (`.bridge.lock`) to prevent concurrent modifications to `chat.md`.
+- Mailbox maintains up to 3 task streams using FIFO: when a 4th root task packet arrives, the oldest stream (including its tasks, revisions, and messages) is deleted.
+- Codex live performs the 3-layer audit (machine checks, diff/scope check, risk sample).
+- When audit passes:
+  - If `ACCEPTANCE_MODE: delegated` → marks `approved`.
+  - If `ACCEPTANCE_MODE: user_required` → marks `verified`, awaiting User confirmation.
+- When audit fails:
+  - Writes revision packet incrementing `ROUND`, pointing to `PARENT_TASK`, and re-queues until `MAX_ROUNDS` is reached.
+- If rounds are exhausted without passing, state moves to `stopped` with `MAX_ROUNDS_EXHAUSTED`.
